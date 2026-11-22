@@ -16,7 +16,7 @@ You write the SQL. The gym runs it on your local ClickHouse and checks it:
 ## Start
 
 ```bash
-make up      # start ClickHouse (docker-compose.yml)
+make up      # start ClickHouse and a single-node Kafka (docker-compose.yml)
 make gym     # first run loads the `gym` database from S3 (~30M rows, a few minutes)
 ```
 
@@ -24,7 +24,7 @@ Everything happens in a separate `gym` database, so your `default` tables are un
 Progress and input history are kept in `~/.clickhouse_gym/`. Local files for the
 `FROM INFILE` exercises are generated in `gym/data/`.
 
-## Topics (109 exercises)
+## Topics (113 exercises)
 
 | | Topic | Covers |
 |---|---|---|
@@ -38,6 +38,7 @@ Progress and input history are kept in `~/.clickhouse_gym/`. Local files for the
 | V | Materialized views (11) | incremental MVs, SummingMergeTree, AggregatingMergeTree (-State / -Merge), backfills, refreshable MVs |
 | D | Dictionaries and joins (7) | HTTP and ClickHouse-table sources, joins with a dictionary, dictGet |
 | A | Accelerate queries (7) | EXPLAIN indexes, bloom_filter / minmax / set indexes, projections, TTL changes |
+| K | Kafka streaming (4) | Kafka engine table, Kafka → MV → MergeTree, virtual columns (_offset, _partition …), dead-letter table |
 
 ## Exam objectives → exercises
 
@@ -105,5 +106,8 @@ Start focused from the shell: `python3 gym/gym.py --topic=V,D`.
   the gym reads the local file and sends it to the server.
 - Connection settings: `CH_HOST`, `CH_PORT` (HTTP, default 8123), `CH_USER`, `CH_PASSWORD`
   (defaults match `docker-compose.yml`).
+- The K exercises use the `kafka` service (`kafka:9092` from the ClickHouse container;
+  override with `CH_KAFKA`). Their checks inspect the tables and views you create, so
+  they don't wait for messages.
 - `python3 gym/gym.py --selftest` runs every reference solution through the checker.
 - Exercises live in `gym/exercises.py`; add your own with `ex(...)`.

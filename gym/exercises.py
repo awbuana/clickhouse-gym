@@ -20,6 +20,7 @@ DB = "gym"
 PASSWORD = os.environ.get("CH_PASSWORD", "clickhouse")
 PRICES_URL = "https://learn-clickhouse.s3.us-east-2.amazonaws.com/uk_property_prices/uk_prices.csv.zst"
 RATES_URL = "https://learnclickhouse.s3.us-east-2.amazonaws.com/datasets/mortgage_rates.csv"
+KAFKA = os.environ.get("CH_KAFKA", "kafka:9092")  # broker address as seen from the ClickHouse server
 
 SECTIONS = [
     ("I", "Inspect tables"),
@@ -32,6 +33,7 @@ SECTIONS = [
     ("V", "Materialized views"),
     ("D", "Dictionaries and joins"),
     ("A", "Accelerate queries"),
+    ("K", "Kafka streaming"),
 ]
 
 EXERCISES = []
@@ -1817,6 +1819,162 @@ ex("A7", "set skipping index",
    setup=["ALTER TABLE uk_prices_3 DROP INDEX IF EXISTS type_set"],
    hints=["TYPE set(max_rows): 0 means unlimited distinct values.",
           "Good for low-cardinality columns within each block."])
+
+# =====================================================================
+# K. Kafka streaming (structure only: checks are instant, no messages needed)
+# =====================================================================
+
+SALES_QUEUE = sql(f"""
+    CREATE TABLE sales_queue
+    (
+        price UInt32,
+        date Date,
+        town String,
+        county String,
+        type String
+    )
+    ENGINE = Kafka
+    SETTINGS
+        kafka_broker_list = '{KAFKA}',
+        kafka_topic_list = 'uk_sales',
+        kafka_group_name = 'gym_sales',
+        kafka_format = 'JSONEachRow'
+""")
+
+KAFKA_CLEAN = ["DROP VIEW IF EXISTS sales_mv", "DROP VIEW IF EXISTS sales_meta_mv"]
+
+ex("K1", "Kafka engine table",
+   f"""
+   Create `sales_queue`, a Kafka engine table that reads JSON messages (one object per
+   message) from topic `uk_sales` on broker `{KAFKA}` with consumer group `gym_sales`.
+   Columns: price UInt32, date Date, town String, county String, type String.
+   """,
+   SALES_QUEUE,
+   check=[exists("sales_queue", "Kafka"),
+          cols("sales_queue", [("price", "UInt32"), ("date", "Date"), ("town", "String"),
+                               ("county", "String"), ("type", "String")]),
+          ddl_has("sales_queue", f"kafka_broker_list = '{KAFKA}'", f"kafka_broker_list should be '{KAFKA}'"),
+          ddl_has("sales_queue", "kafka_topic_list = 'uk_sales'", "kafka_topic_list should be 'uk_sales'"),
+          ddl_has("sales_queue", "kafka_group_name = 'gym_sales'", "kafka_group_name should be 'gym_sales'"),
+          ddl_has("sales_queue", "kafka_format = 'JSONEachRow'", "kafka_format should be 'JSONEachRow'")],
+   setup=KAFKA_CLEAN + ["DROP TABLE IF EXISTS sales_queue"],
+   hints=["ENGINE = Kafka SETTINGS kafka_broker_list = ..., kafka_topic_list = ..., kafka_group_name = ..., kafka_format = ...",
+          "A Kafka table stores nothing. It is a consumer, and rows flow only to materialized views attached to it.",
+          "Selecting from it directly is blocked by default (and would consume the messages)."])
+
+ex("K2", "Kafka → MergeTree pipeline",
+   """
+   `sales_queue` (Kafka) exists. Create `sales` (price UInt32, date Date, town, county
+   and type as LowCardinality(String)), a MergeTree ordered by (town, date), and the
+   materialized view `sales_mv` that moves every consumed message from `sales_queue`
+   into `sales`.
+   """,
+   """
+   CREATE TABLE sales
+   (
+       price UInt32,
+       date Date,
+       town LowCardinality(String),
+       county LowCardinality(String),
+       type LowCardinality(String)
+   )
+   ENGINE = MergeTree
+   ORDER BY (town, date);
+
+   CREATE MATERIALIZED VIEW sales_mv TO sales
+   AS SELECT price, date, town, county, type
+   FROM sales_queue
+   """,
+   check=[exists("sales", "MergeTree"),
+          field("sales", "sorting_key", "town, date", "sales should be ORDER BY (town, date)"),
+          coltype("sales", "town", ["LowCardinality(String)"]),
+          exists("sales_mv", "MaterializedView"),
+          ddl_has("sales_mv", "TO gym.sales ", "sales_mv should write TO sales"),
+          ddl_has("sales_mv", "FROM gym.sales_queue", "sales_mv should read FROM sales_queue")],
+   setup=KAFKA_CLEAN + ["DROP TABLE IF EXISTS sales", if_not_exists(SALES_QUEUE)],
+   hints=["Kafka table → materialized view → MergeTree: the classic three-object pattern.",
+          "Consumption starts when the view is attached. Offsets are committed after each block is written.",
+          "Pause with DETACH TABLE sales_mv and resume with ATTACH TABLE sales_mv."])
+
+ex("K3", "Kafka virtual columns",
+   """
+   Keep the Kafka metadata of every message. Create `sales_meta` (topic String,
+   partition UInt64, offset UInt64, ts DateTime, price UInt32), a MergeTree ordered by
+   (topic, partition, offset), and the view `sales_meta_mv` from `sales_queue` that fills
+   topic, partition, offset and ts from each message's Kafka metadata.
+   """,
+   """
+   CREATE TABLE sales_meta
+   (
+       topic String,
+       partition UInt64,
+       offset UInt64,
+       ts DateTime,
+       price UInt32
+   )
+   ENGINE = MergeTree
+   ORDER BY (topic, partition, offset);
+
+   CREATE MATERIALIZED VIEW sales_meta_mv TO sales_meta
+   AS SELECT
+       _topic AS topic,
+       _partition AS partition,
+       _offset AS offset,
+       _timestamp AS ts,
+       price
+   FROM sales_queue
+   """,
+   check=[exists("sales_meta", "MergeTree"),
+          field("sales_meta", "sorting_key", "topic, partition, offset",
+                "sales_meta should be ORDER BY (topic, partition, offset)"),
+          exists("sales_meta_mv", "MaterializedView"),
+          ddl_has("sales_meta_mv", "_topic", "Use the _topic virtual column"),
+          ddl_has("sales_meta_mv", "_partition", "Use the _partition virtual column"),
+          ddl_has("sales_meta_mv", "_offset", "Use the _offset virtual column"),
+          ddl_has("sales_meta_mv", "_timestamp", "Use the _timestamp virtual column")],
+   setup=KAFKA_CLEAN + ["DROP TABLE IF EXISTS sales_meta", if_not_exists(SALES_QUEUE)],
+   hints=["Kafka tables expose _topic, _key, _offset, _partition, _timestamp, _headers.name and _headers.value.",
+          "Virtual columns aren't in SELECT *. Name them explicitly."])
+
+ex("K4", "Dead-letter table for bad messages",
+   f"""
+   Topic `uk_sales_dirty` has JSON messages mixed with broken ones. Create `dirty_queue`
+   (price UInt32, town String; JSONEachRow, group `gym_dirty`, broker `{KAFKA}`) so that
+   a bad message doesn't stop consumption. Then create `bad_messages` (raw String,
+   error String), a MergeTree ordered by tuple(), and the view `bad_messages_mv` that
+   stores only the messages that failed to parse, with their error.
+   """,
+   f"""
+   CREATE TABLE dirty_queue (price UInt32, town String)
+   ENGINE = Kafka
+   SETTINGS
+       kafka_broker_list = '{KAFKA}',
+       kafka_topic_list = 'uk_sales_dirty',
+       kafka_group_name = 'gym_dirty',
+       kafka_format = 'JSONEachRow',
+       kafka_handle_error_mode = 'stream';
+
+   CREATE TABLE bad_messages (raw String, error String)
+   ENGINE = MergeTree
+   ORDER BY tuple();
+
+   CREATE MATERIALIZED VIEW bad_messages_mv TO bad_messages
+   AS SELECT _raw_message AS raw, _error AS error
+   FROM dirty_queue
+   WHERE length(_error) > 0
+   """,
+   check=[exists("dirty_queue", "Kafka"),
+          ddl_has("dirty_queue", "kafka_topic_list = 'uk_sales_dirty'", "kafka_topic_list should be 'uk_sales_dirty'"),
+          ddl_has("dirty_queue", "kafka_handle_error_mode = 'stream'", "Set kafka_handle_error_mode = 'stream'"),
+          exists("bad_messages", "MergeTree"),
+          exists("bad_messages_mv", "MaterializedView"),
+          ddl_has("bad_messages_mv", "_raw_message", "Store _raw_message"),
+          ddl_has("bad_messages_mv", "_error", "Store _error and keep only rows where it is not empty")],
+   setup=["DROP VIEW IF EXISTS bad_messages_mv", "DROP TABLE IF EXISTS bad_messages",
+          "DROP TABLE IF EXISTS dirty_queue"],
+   hints=["kafka_handle_error_mode = 'stream' turns a parse error into a row with _error and _raw_message set.",
+          "A second view WHERE length(_error) = 0 would carry the good rows to their own table.",
+          "The alternative kafka_skip_broken_messages = N silently drops up to N bad messages per block."])
 
 # Keep exercises grouped in SECTIONS order.
 _ORDER = {code: i for i, (code, _) in enumerate(SECTIONS)}
