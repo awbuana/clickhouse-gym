@@ -86,8 +86,13 @@ GYM_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(GYM_DIR)
 INFILE_RE = re.compile(
     r"^(?P<head>INSERT\s+INTO\s+.+?)\s+FROM\s+INFILE\s+'(?P<path>[^']+)'"
-    r"(?:\s+COMPRESSION\s+'(?P<comp>[^']*)')?\s+(?P<fmt>FORMAT\s+\w+)\s*$",
+    r"(?:\s+COMPRESSION\s+'(?P<comp>[^']*)')?(?:\s+FORMAT\s+(?P<fmt>\w+))?\s*$",
     re.I | re.S)
+
+# Like clickhouse-client: without FORMAT, the format comes from the file extension.
+EXT_FORMATS = {".csv": "CSV", ".tsv": "TabSeparated", ".parquet": "Parquet", ".json": "JSONEachRow",
+               ".ndjson": "JSONEachRow", ".jsonl": "JSONEachRow", ".orc": "ORC", ".avro": "Avro",
+               ".arrow": "Arrow"}
 
 
 def resolve_path(path):
@@ -112,7 +117,10 @@ def execute(stmt):
                 body = f.read()
         except OSError as e:
             raise CHError(f"Cannot read {m.group('path')}: {e.strerror}")
-        return run(f"{m.group('head')} {m.group('fmt')}", body=body)
+        fmt = m.group("fmt") or EXT_FORMATS.get(os.path.splitext(path)[1].lower())
+        if not fmt:
+            raise CHError(f"Can't tell the format of {m.group('path')} from its extension. Add FORMAT <name>.")
+        return run(f"{m.group('head')} FORMAT {fmt}", body=body)
     return run(stmt)
 
 
